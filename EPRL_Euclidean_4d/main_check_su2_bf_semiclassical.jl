@@ -2,6 +2,36 @@ using Distributed
 
 const eprl_dir = @__DIR__
 
+function add_requested_su2_bf_workers()
+    requested_workers = parse(Int, get(ENV, "SU2_BF_NWORKERS", "0"))
+    requested_workers <= 0 && return nothing
+
+    if nprocs() > 1
+        @warn(
+            "Workers are already running. SU2_BF_NWORKERS is ignored. " *
+            "For large runs, prefer `SU2_BF_NWORKERS=N julia main_check_su2_bf_semiclassical.jl` " *
+            "instead of `julia -p N ...`, so the script can use topology=:master_worker."
+        )
+        return nothing
+    end
+
+    active_project = Base.active_project()
+
+    if active_project === nothing
+        addprocs(requested_workers; topology = :master_worker)
+    else
+        addprocs(
+            requested_workers;
+            topology = :master_worker,
+            exeflags = "--project=$(active_project)",
+        )
+    end
+
+    return nothing
+end
+
+add_requested_su2_bf_workers()
+
 @everywhere begin
     include(joinpath($eprl_dir, "semiclassical", "semiclassical_vertex_tools.jl"))
 end
@@ -111,13 +141,14 @@ function su2_bf_coherent_amplitude_parallel_over_intertwiners(
         intertwiner_ranges[2],
     ))
 
+    number_of_worker_processes = max(nprocs() - 1, 0)
     number_of_chunks =
-        nworkers() == 0 ? 1 :
-        min(length(first_two_pairs), nworkers() * chunks_per_worker)
+        nprocs() == 1 ? 1 :
+        min(length(first_two_pairs), number_of_worker_processes * chunks_per_worker)
 
     chunks = split_into_chunks(first_two_pairs, number_of_chunks)
 
-    if nworkers() == 0
+    if nprocs() == 1
         return su2_bf_intertwiner_chunk_sum(
             simplex,
             spin_data,
@@ -306,8 +337,9 @@ println("vertex backend = fast 6j local vertex + fast 6j recoupling")
 println("simplex        = ", simplex)
 println("base spin      = ", base_spin)
 println("lambda values  = ", lambda_values)
-println("processes      = ", nprocs(), " total, ", nworkers(), " workers")
+println("processes      = ", nprocs(), " total, ", max(nprocs() - 1, 0), " worker process(es)")
 println("parallelism    = over intertwiner chunks inside each lambda")
+println("worker launch  = ", get(ENV, "SU2_BF_NWORKERS", "0") == "0" ? "Julia command line / existing workers" : "script addprocs(...; topology=:master_worker)")
 println("chunks/worker  = ", chunks_per_worker)
 println("cutoff         = none; this is a fixed-boundary coherent vertex amplitude")
 println()
