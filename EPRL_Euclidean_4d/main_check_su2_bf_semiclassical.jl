@@ -1,59 +1,41 @@
-using Distributed
+include(joinpath(@__DIR__, "semiclassical", "semiclassical_vertex_tools.jl"))
 
-const eprl_dir = @__DIR__
-
-function add_requested_su2_bf_workers()
-    requested_workers = parse(Int, get(ENV, "SU2_BF_NWORKERS", "0"))
-    requested_workers <= 0 && return nothing
-
-    if nprocs() > 1
-        @warn(
-            "Workers are already running. SU2_BF_NWORKERS is ignored. " *
-            "For large runs, prefer `SU2_BF_NWORKERS=N julia main_check_su2_bf_semiclassical.jl` " *
-            "instead of `julia -p N ...`, so the script can use topology=:master_worker."
-        )
-        return nothing
-    end
-
-    active_project = Base.active_project()
-
-    if active_project === nothing
-        addprocs(requested_workers; topology = :master_worker)
-    else
-        addprocs(
-            requested_workers;
-            topology = :master_worker,
-            exeflags = "--project=$(active_project)",
-        )
-    end
-
-    return nothing
-end
-
-add_requested_su2_bf_workers()
-
-@everywhere begin
-    include(joinpath($eprl_dir, "semiclassical", "semiclassical_vertex_tools.jl"))
-end
-
-using Plots
+# Server-safe SU(2) BF coherent-boundary semiclassical scan.
+#
+# This script does not use Julia Distributed.  Instead, for each fixed lambda
+# it launches independent Julia child processes, each evaluating one chunk of
+# the boundary-intertwiner sum.  This avoids the TCP worker-credential errors
+# that can appear with `julia -p N` on some servers.
 
 const simplex = (1, 2, 3, 4, 5)
 const base_spin = 1 // 2
 
-# Equispin scaling:
-#
-#     j_ab(lambda) = lambda/2.
-#
-# This is the BF vertex amplitude contracted with Livine-Speziale coherent
-# boundary intertwiners.  It has no internal-spin cutoff; the only scan
-# parameter here is lambda.
 lambda_start = parse(Int, get(ENV, "SU2_BF_LAMBDA_START", "1"))
 lambda_stop = parse(Int, get(ENV, "SU2_BF_LAMBDA_STOP", "70"))
 lambda_values = collect(lambda_start:lambda_stop)
-chunks_per_worker = parse(Int, get(ENV, "SU2_BF_CHUNKS_PER_WORKER", "2"))
 
-@everywhere function su2_bf_intertwiner_chunk_sum(
+# Number of independent Julia child processes used inside each lambda.
+# Use this instead of `julia -p N`.
+process_workers = parse(Int, get(ENV, "SU2_BF_NWORKERS", "1"))
+
+const output_dir = joinpath(@__DIR__, "outputs")
+const partial_dir = joinpath(output_dir, "su2_bf_partial_sums")
+const csv_file = joinpath(output_dir, "su2_bf_coherent_vertex_lambda_scan.csv")
+const plot_file = joinpath(output_dir, "su2_bf_coherent_lambda6_scan.png")
+
+function split_into_chunks(values, number_of_chunks)
+    isempty(values) && return []
+
+    number_of_chunks = max(1, min(number_of_chunks, length(values)))
+    chunk_size = cld(length(values), number_of_chunks)
+
+    return [
+        values[first:min(first + chunk_size - 1, length(values))]
+        for first in 1:chunk_size:length(values)
+    ]
+end
+
+function su2_bf_intertwiner_chunk_sum(
     simplex,
     spin_data::AbstractDict,
     tetrahedra,
@@ -93,41 +75,89 @@ chunks_per_worker = parse(Int, get(ENV, "SU2_BF_CHUNKS_PER_WORKER", "2"))
     return total
 end
 
-@everywhere function warmup_su2_bf_worker(base_spin, simplex)
-    j = base_spin
+function coherent_boundary_data_for_lambda(lambda)
+    j = lambda * base_spin
     spin_data, normal_data = regular_4simplex_boundary_data(simplex, j)
 
-    return coherent_su2_bf_single_vertex_amplitude_6j(
-        simplex,
-        spin_data,
-        normal_data,
+    return j, spin_data, normal_data
+end
+
+function first_two_intertwiner_pair_chunks(lambda, number_of_chunks)
+    _, spin_data, _ = coherent_boundary_data_for_lambda(lambda)
+    tetrahedra = oriented_simplex_tetrahedra(simplex)
+    intertwiner_ranges = [
+        allowed_global_intertwiners(tetrahedron, spin_data)
+        for tetrahedron in tetrahedra
+    ]
+
+    any(isempty, intertwiner_ranges) && return []
+
+    first_two_pairs = collect(Iterators.product(
+        intertwiner_ranges[1],
+        intertwiner_ranges[2],
+    ))
+
+    return split_into_chunks(first_two_pairs, number_of_chunks)
+end
+
+function partial_sum_filename(lambda, chunk_id)
+    return joinpath(
+        partial_dir,
+        "lambda_$(lambda)_chunk_$(chunk_id).csv",
     )
 end
 
-function split_into_chunks(values, number_of_chunks)
-    number_of_chunks = max(1, min(number_of_chunks, length(values)))
-    chunk_size = cld(length(values), number_of_chunks)
-
-    return [
-        values[first:min(first + chunk_size - 1, length(values))]
-        for first in 1:chunk_size:length(values)
-    ]
+function write_partial_sum(filename, lambda, chunk_id, nchunks, partial_sum, elapsed)
+    open(filename, "w") do io
+        println(io, "lambda,chunk_id,nchunks,real_partial,imag_partial,elapsed_seconds")
+        println(
+            io,
+            lambda, ",",
+            chunk_id, ",",
+            nchunks, ",",
+            real(partial_sum), ",",
+            imag(partial_sum), ",",
+            elapsed,
+        )
+    end
 end
 
-function su2_bf_coherent_amplitude_parallel_over_intertwiners(
-    simplex,
-    spin_data::AbstractDict,
-    normal_data::AbstractDict,
-)
-    sigma = oriented_four_simplex(simplex)
-    tetrahedra = oriented_simplex_tetrahedra(sigma)
+function read_partial_sum(filename)
+    lines = readlines(filename)
+    length(lines) >= 2 ||
+        throw(ArgumentError("partial sum file is empty: $filename"))
+
+    fields = split(lines[2], ",")
+    length(fields) == 6 ||
+        throw(ArgumentError("partial sum file has wrong format: $filename"))
+
+    return (
+        lambda = parse(Int, fields[1]),
+        chunk_id = parse(Int, fields[2]),
+        nchunks = parse(Int, fields[3]),
+        partial_sum = parse(Float64, fields[4]) + im * parse(Float64, fields[5]),
+        elapsed = parse(Float64, fields[6]),
+    )
+end
+
+function run_partial_sum_worker()
+    lambda = parse(Int, ENV["SU2_BF_WORKER_LAMBDA"])
+    chunk_id = parse(Int, ENV["SU2_BF_WORKER_CHUNK_ID"])
+    nchunks = parse(Int, ENV["SU2_BF_WORKER_NCHUNKS"])
+    output_file = ENV["SU2_BF_WORKER_OUTPUT_FILE"]
+
+    _, spin_data, normal_data = coherent_boundary_data_for_lambda(lambda)
+    tetrahedra = oriented_simplex_tetrahedra(simplex)
 
     intertwiner_ranges = [
         allowed_global_intertwiners(tetrahedron, spin_data)
         for tetrahedron in tetrahedra
     ]
 
-    any(isempty, intertwiner_ranges) && return 0.0 + 0.0im
+    any(isempty, intertwiner_ranges) && begin
+        write_partial_sum(output_file, lambda, chunk_id, nchunks, 0.0 + 0.0im, 0.0)
+        return nothing
+    end
 
     coefficient_table = coherent_intertwiner_coefficient_table(
         tetrahedra,
@@ -141,84 +171,32 @@ function su2_bf_coherent_amplitude_parallel_over_intertwiners(
         intertwiner_ranges[2],
     ))
 
-    number_of_worker_processes = max(nprocs() - 1, 0)
-    number_of_chunks =
-        nprocs() == 1 ? 1 :
-        min(length(first_two_pairs), number_of_worker_processes * chunks_per_worker)
+    chunks = split_into_chunks(first_two_pairs, nchunks)
+    chunk =
+        chunk_id <= length(chunks) ? chunks[chunk_id] :
+        Tuple{eltype(first_two_pairs)}[]
 
-    chunks = split_into_chunks(first_two_pairs, number_of_chunks)
-
-    if nprocs() == 1
-        return su2_bf_intertwiner_chunk_sum(
-            simplex,
-            spin_data,
-            tetrahedra,
-            coefficient_table,
-            intertwiner_ranges,
-            only(chunks),
-        )
-    end
-
-    partial_sums = pmap(
-        chunk -> su2_bf_intertwiner_chunk_sum(
-            simplex,
-            spin_data,
-            tetrahedra,
-            coefficient_table,
-            intertwiner_ranges,
-            chunk,
-        ),
-        chunks,
-    )
-
-    return sum(partial_sums; init = 0.0 + 0.0im)
-end
-
-function su2_bf_coherent_lambda_row(lambda::Integer, base_spin, simplex)
-    j = lambda * base_spin
-    spin_data, normal_data = regular_4simplex_boundary_data(simplex, j)
-
-    closure_error = max_closure_norm(simplex, spin_data, normal_data)
-
-    W = 0.0 + 0.0im
-    elapsed = @elapsed W = su2_bf_coherent_amplitude_parallel_over_intertwiners(
+    partial_sum = 0.0 + 0.0im
+    elapsed = @elapsed partial_sum = su2_bf_intertwiner_chunk_sum(
         simplex,
         spin_data,
-        normal_data,
+        tetrahedra,
+        coefficient_table,
+        intertwiner_ranges,
+        chunk,
     )
 
-    scaled_W = lambda^6 * W
-    S_int = regular_4simplex_su2_bf_regge_action(j; dihedral = :interior)
-    S_ext = regular_4simplex_su2_bf_regge_action(j; dihedral = :exterior)
-
-    return (
-        lambda = lambda,
-        j = j,
-        W = W,
-        scaled_W = scaled_W,
-        S_int = S_int,
-        S_ext = S_ext,
-        closure_error = closure_error,
-        elapsed = elapsed,
-    )
-end
-
-function warmup_su2_bf_workers()
-    if nprocs() == 1
-        warmup_su2_bf_worker(base_spin, simplex)
-    else
-        @sync for worker in workers()
-            @async remotecall_fetch(
-                warmup_su2_bf_worker,
-                worker,
-                base_spin,
-                simplex,
-            )
-        end
-    end
+    write_partial_sum(output_file, lambda, chunk_id, nchunks, partial_sum, elapsed)
 
     return nothing
 end
+
+if get(ENV, "SU2_BF_PARTIAL_WORKER", "0") == "1"
+    run_partial_sum_worker()
+    exit()
+end
+
+using Plots
 
 function save_su2_bf_scan_csv(filename, scan)
     open(filename, "w") do io
@@ -246,14 +224,6 @@ function save_su2_bf_scan_csv(filename, scan)
             )
         end
     end
-end
-
-function checkpoint_su2_bf_scan(scan, csv_file, plot_file)
-    sorted_scan = sort(scan; by = row -> row.lambda)
-    save_su2_bf_scan_csv(csv_file, sorted_scan)
-    plot_su2_bf_scan(sorted_scan, plot_file)
-
-    return sorted_scan
 end
 
 function plot_su2_bf_scan(scan, plot_file)
@@ -303,6 +273,92 @@ function plot_su2_bf_scan(scan, plot_file)
     savefig(plot_file)
 end
 
+function checkpoint_su2_bf_scan(scan)
+    sorted_scan = sort(scan; by = row -> row.lambda)
+    save_su2_bf_scan_csv(csv_file, sorted_scan)
+    plot_su2_bf_scan(sorted_scan, plot_file)
+
+    return sorted_scan
+end
+
+function worker_command(lambda, chunk_id, nchunks, output_file)
+    command = `$(Base.julia_cmd()) --startup-file=no $(abspath(PROGRAM_FILE))`
+
+    return addenv(
+        command,
+        "SU2_BF_PARTIAL_WORKER" => "1",
+        "SU2_BF_WORKER_LAMBDA" => string(lambda),
+        "SU2_BF_WORKER_CHUNK_ID" => string(chunk_id),
+        "SU2_BF_WORKER_NCHUNKS" => string(nchunks),
+        "SU2_BF_WORKER_OUTPUT_FILE" => output_file,
+    )
+end
+
+function run_lambda_with_process_chunks(lambda)
+    mkpath(partial_dir)
+
+    _, spin_data, normal_data = coherent_boundary_data_for_lambda(lambda)
+    closure_error = max_closure_norm(simplex, spin_data, normal_data)
+
+    chunks = first_two_intertwiner_pair_chunks(lambda, process_workers)
+    nchunks = length(chunks)
+
+    nchunks == 0 && begin
+        j = lambda * base_spin
+        W = 0.0 + 0.0im
+        return (
+            lambda = lambda,
+            j = j,
+            W = W,
+            scaled_W = lambda^6 * W,
+            S_int = regular_4simplex_su2_bf_regge_action(j; dihedral = :interior),
+            S_ext = regular_4simplex_su2_bf_regge_action(j; dihedral = :exterior),
+            closure_error = closure_error,
+            elapsed = 0.0,
+        )
+    end
+
+    output_files = [partial_sum_filename(lambda, chunk_id) for chunk_id in 1:nchunks]
+
+    for output_file in output_files
+        isfile(output_file) && rm(output_file)
+    end
+
+    elapsed_total = @elapsed begin
+        processes = [
+            run(
+                worker_command(lambda, chunk_id, nchunks, output_files[chunk_id]);
+                wait = false,
+            )
+            for chunk_id in 1:nchunks
+        ]
+
+        for process in processes
+            wait(process)
+            success(process) || error("a partial worker failed for lambda=$lambda")
+        end
+    end
+
+    partial_rows = [read_partial_sum(output_file) for output_file in output_files]
+    W = sum(row.partial_sum for row in partial_rows; init = 0.0 + 0.0im)
+
+    j = lambda * base_spin
+    scaled_W = lambda^6 * W
+    S_int = regular_4simplex_su2_bf_regge_action(j; dihedral = :interior)
+    S_ext = regular_4simplex_su2_bf_regge_action(j; dihedral = :exterior)
+
+    return (
+        lambda = lambda,
+        j = j,
+        W = W,
+        scaled_W = scaled_W,
+        S_int = S_int,
+        S_ext = S_ext,
+        closure_error = closure_error,
+        elapsed = elapsed_total,
+    )
+end
+
 function print_scan_row(row)
     println(
         row.lambda, "       ",
@@ -316,49 +372,33 @@ function print_scan_row(row)
     flush(stdout)
 end
 
-function run_su2_bf_scan_streaming(lambda_values, csv_file, plot_file)
-    scan = []
-
-    println()
-    println("lambda  j       |W|                 arg(W)       Re(lambda^6 W)       Im(lambda^6 W)       time")
-
-    for lambda in lambda_values
-        row = su2_bf_coherent_lambda_row(lambda, base_spin, simplex)
-        push!(scan, row)
-        checkpoint_su2_bf_scan(scan, csv_file, plot_file)
-        print_scan_row(row)
-    end
-
-    return checkpoint_su2_bf_scan(scan, csv_file, plot_file)
-end
-
 println("SU(2) BF vertex amplitude with coherent boundary state")
 println("vertex backend = fast 6j local vertex + fast 6j recoupling")
+println("parallelism    = independent Julia processes over intertwiner chunks")
 println("simplex        = ", simplex)
 println("base spin      = ", base_spin)
 println("lambda values  = ", lambda_values)
-println("processes      = ", nprocs(), " total, ", max(nprocs() - 1, 0), " worker process(es)")
-println("parallelism    = over intertwiner chunks inside each lambda")
-println("worker launch  = ", get(ENV, "SU2_BF_NWORKERS", "0") == "0" ? "Julia command line / existing workers" : "script addprocs(...; topology=:master_worker)")
-println("chunks/worker  = ", chunks_per_worker)
+println("chunk workers  = ", process_workers, " per lambda")
 println("cutoff         = none; this is a fixed-boundary coherent vertex amplitude")
 println()
 
-println("Warming up workers...")
-warmup_su2_bf_workers()
-
-output_dir = joinpath(@__DIR__, "outputs")
 mkpath(output_dir)
+mkpath(partial_dir)
 
-csv_file = joinpath(output_dir, "su2_bf_coherent_vertex_lambda_scan.csv")
-plot_file = joinpath(output_dir, "su2_bf_coherent_lambda6_scan.png")
-
-println("Running lambda scan...")
 println("Each completed lambda is checkpointed immediately.")
 println("checkpoint data = ", csv_file)
 println("checkpoint plot = ", plot_file)
+println()
+println("lambda  j       |W|                 arg(W)       Re(lambda^6 W)       Im(lambda^6 W)       time")
 
-scan = run_su2_bf_scan_streaming(lambda_values, csv_file, plot_file)
+scan = []
+
+for lambda in lambda_values
+    row = run_lambda_with_process_chunks(lambda)
+    push!(scan, row)
+    checkpoint_su2_bf_scan(scan)
+    print_scan_row(row)
+end
 
 println()
 println("Expected SU(2) BF large-spin structure:")
