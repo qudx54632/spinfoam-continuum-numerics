@@ -101,6 +101,61 @@ function regular_4simplex_boundary_data(simplex, j)
     return spin_data, normal_data
 end
 
+"""
+Equilateral Euclidean twisted-spike boundary data used in arXiv:1903.12624,
+Table 2.
+
+The spins are all equal to `j`.  The normals are the twisted-spike normals,
+so the two normals associated to the same triangle are pairwise opposite:
+
+    n_ab = - n_ba.
+
+The labels `a,b=1,...,5` denote the tetrahedra opposite the corresponding
+vertices of `simplex`.
+"""
+function paper_twisted_spike_boundary_data(simplex, j)
+    vertices = Tuple(simplex)
+
+    spin_data = Dict(
+        triangle => j
+        for triangle in oriented_simplex_spin_keys(simplex)
+    )
+
+    # Full-precision reconstruction of the rounded normals shown in
+    # arXiv:1903.12624, Table 2.
+    normal_pairs = Dict(
+        (1, 2) => ( 0.000000000000000,  0.000000000000000,  1.000000000000000),
+        (1, 3) => ( 0.942809041582063,  0.000000000000000, -0.333333333333333),
+        (1, 4) => (-0.471404520791032,  0.816496580927726, -0.333333333333333),
+        (1, 5) => (-0.471404520791032, -0.816496580927726, -0.333333333333333),
+        (2, 3) => (-0.235702260395516, -0.912870929175277,  0.333333333333333),
+        (2, 4) => ( 0.908420545240331,  0.252311319355707,  0.333333333333333),
+        (2, 5) => (-0.672718284844815,  0.660559609819570,  0.333333333333333),
+        (3, 4) => ( 0.090030252245699, -0.660559609819570, -0.745355992499930),
+        (3, 5) => ( 0.617076528940514, -0.252311319355707,  0.745355992499930),
+        (4, 5) => ( 0.527046276694815,  0.408248290463863, -0.745355992499930),
+    )
+
+    normal_data = Dict()
+
+    for a in 1:5
+        tau = tetrahedron_key((vertices[c] for c in 1:5 if c != a)...)
+
+        for b in 1:5
+            a == b && continue
+
+            pair = a < b ? (a, b) : (b, a)
+            sign = a < b ? 1.0 : -1.0
+            n = normal_pairs[pair]
+
+            f = triangle_key((vertices[c] for c in 1:5 if c != a && c != b)...)
+            normal_data[(tau, f)] = Tuple(sign * n[mu] for mu in 1:3)
+        end
+    end
+
+    return spin_data, normal_data
+end
+
 function max_closure_norm(simplex, spin_data, normal_data)
     max_norm = 0.0
 

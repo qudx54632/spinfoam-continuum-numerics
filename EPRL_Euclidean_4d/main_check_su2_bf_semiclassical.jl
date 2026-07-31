@@ -77,7 +77,7 @@ end
 
 function coherent_boundary_data_for_lambda(lambda)
     j = lambda * base_spin
-    spin_data, normal_data = regular_4simplex_boundary_data(simplex, j)
+    spin_data, normal_data = paper_twisted_spike_boundary_data(simplex, j)
 
     return j, spin_data, normal_data
 end
@@ -198,6 +198,24 @@ end
 
 using Plots
 
+function regge_cosine_fit(phases, values)
+    length(values) < 2 && return nothing
+
+    design_matrix = hcat(cos.(phases), sin.(phases))
+    coefficients = design_matrix \ values
+    fitted_values = design_matrix * coefficients
+
+    cosine_coefficient, sine_coefficient = coefficients
+    amplitude = hypot(cosine_coefficient, sine_coefficient)
+    phase = atan(-sine_coefficient, cosine_coefficient)
+
+    return (
+        amplitude = amplitude,
+        phase = phase,
+        fitted_values = fitted_values,
+    )
+end
+
 function save_su2_bf_scan_csv(filename, scan)
     open(filename, "w") do io
         println(
@@ -231,10 +249,9 @@ function plot_su2_bf_scan(scan, plot_file)
     scaled_real = [real(row.scaled_W) for row in scan]
     scaled_imag = [imag(row.scaled_W) for row in scan]
     scaled_abs = [abs(row.scaled_W) for row in scan]
-    cos_regge = [cos(row.S_ext) for row in scan]
-
-    scale = maximum(abs.(vcat(scaled_real, scaled_imag)))
-    scaled_cos_regge = scale == 0 ? cos_regge : scale .* cos_regge
+    regge_phases = [row.S_ext for row in scan]
+    real_fit = regge_cosine_fit(regge_phases, scaled_real)
+    imag_fit = regge_cosine_fit(regge_phases, scaled_imag)
 
     p1 = plot(
         x,
@@ -252,13 +269,25 @@ function plot_su2_bf_scan(scan, plot_file)
         label = "Im(lambda^6 W)",
     )
 
-    plot!(
-        p1,
-        x,
-        scaled_cos_regge;
-        linestyle = :dash,
-        label = "rescaled cos(S_BF exterior)",
-    )
+    if real_fit !== nothing
+        plot!(
+            p1,
+            x,
+            real_fit.fitted_values;
+            linestyle = :dash,
+            label = "Re fit: A cos(S_ext + phi)",
+        )
+    end
+
+    if imag_fit !== nothing
+        plot!(
+            p1,
+            x,
+            imag_fit.fitted_values;
+            linestyle = :dashdot,
+            label = "Im fit: A cos(S_ext + phi)",
+        )
+    end
 
     p2 = plot(
         x,
@@ -271,6 +300,25 @@ function plot_su2_bf_scan(scan, plot_file)
 
     plot(p1, p2; layout = (2, 1), size = (900, 700))
     savefig(plot_file)
+end
+
+function print_regge_fit_summary(scan)
+    length(scan) < 2 && return nothing
+
+    sorted_scan = sort(scan; by = row -> row.lambda)
+    regge_phases = [row.S_ext for row in sorted_scan]
+    scaled_real = [real(row.scaled_W) for row in sorted_scan]
+    scaled_imag = [imag(row.scaled_W) for row in sorted_scan]
+
+    real_fit = regge_cosine_fit(regge_phases, scaled_real)
+    imag_fit = regge_cosine_fit(regge_phases, scaled_imag)
+
+    println()
+    println("Least-squares Regge cosine fit:")
+    println("  Re(lambda^6 W) ≈ ", real_fit.amplitude, " cos(S_ext + ", real_fit.phase, ")")
+    println("  Im(lambda^6 W) ≈ ", imag_fit.amplitude, " cos(S_ext + ", imag_fit.phase, ")")
+
+    return nothing
 end
 
 function checkpoint_su2_bf_scan(scan)
@@ -377,6 +425,7 @@ println("vertex backend = fast 6j local vertex + fast 6j recoupling")
 println("parallelism    = independent Julia processes over intertwiner chunks")
 println("simplex        = ", simplex)
 println("base spin      = ", base_spin)
+println("boundary data  = paper twisted-spike normals, arXiv:1903.12624 Table 2")
 println("lambda values  = ", lambda_values)
 println("chunk workers  = ", process_workers, " per lambda")
 println("cutoff         = none; this is a fixed-boundary coherent vertex amplitude")
@@ -405,6 +454,7 @@ println("Expected SU(2) BF large-spin structure:")
 println("  W(lambda) ~ lambda^(-6) cos(lambda S_BF + constant phase)")
 println("To see the cosine sign oscillation, use Re(lambda^6 W) or Im(lambda^6 W).")
 println("|lambda^6 W| is useful as a magnitude/envelope check, but it removes signs.")
+print_regge_fit_summary(scan)
 println()
 println("saved data     = ", csv_file)
 println("saved plot     = ", plot_file)
