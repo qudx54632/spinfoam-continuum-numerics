@@ -21,20 +21,140 @@ const base_spin = 1 // 2
 lambda_start = parse(Int, get(ENV, "SU2_BF_LAMBDA_START", "1"))
 lambda_stop = parse(Int, get(ENV, "SU2_BF_LAMBDA_STOP", "70"))
 lambda_values = collect(lambda_start:lambda_stop)
+chunks_per_worker = parse(Int, get(ENV, "SU2_BF_CHUNKS_PER_WORKER", "2"))
 
-@everywhere function su2_bf_coherent_lambda_row(lambda::Integer, base_spin, simplex)
+@everywhere function su2_bf_intertwiner_chunk_sum(
+    simplex,
+    spin_data::AbstractDict,
+    tetrahedra,
+    coefficient_table::AbstractDict,
+    intertwiner_ranges,
+    first_two_intertwiner_pairs,
+)
+    sigma = oriented_four_simplex(simplex)
+    total = 0.0 + 0.0im
+
+    for (i1, i2) in first_two_intertwiner_pairs,
+        i3 in intertwiner_ranges[3],
+        i4 in intertwiner_ranges[4],
+        i5 in intertwiner_ranges[5]
+
+        intertwiners = (i1, i2, i3, i4, i5)
+        coefficient_product = coherent_intertwiner_coefficient_product(
+            coefficient_table,
+            tetrahedra,
+            intertwiners,
+        )
+
+        abs(coefficient_product) == 0.0 && continue
+
+        intertwiner_data = Dict(
+            tetrahedron => i
+            for (tetrahedron, i) in zip(tetrahedra, intertwiners)
+        )
+
+        total += simplex_amplitude_recoupled_oriented_6j(
+            sigma,
+            spin_data,
+            intertwiner_data,
+        ) * coefficient_product
+    end
+
+    return total
+end
+
+@everywhere function warmup_su2_bf_worker(base_spin, simplex)
+    j = base_spin
+    spin_data, normal_data = regular_4simplex_boundary_data(simplex, j)
+
+    return coherent_su2_bf_single_vertex_amplitude_6j(
+        simplex,
+        spin_data,
+        normal_data,
+    )
+end
+
+function split_into_chunks(values, number_of_chunks)
+    number_of_chunks = max(1, min(number_of_chunks, length(values)))
+    chunk_size = cld(length(values), number_of_chunks)
+
+    return [
+        values[first:min(first + chunk_size - 1, length(values))]
+        for first in 1:chunk_size:length(values)
+    ]
+end
+
+function su2_bf_coherent_amplitude_parallel_over_intertwiners(
+    simplex,
+    spin_data::AbstractDict,
+    normal_data::AbstractDict,
+)
+    sigma = oriented_four_simplex(simplex)
+    tetrahedra = oriented_simplex_tetrahedra(sigma)
+
+    intertwiner_ranges = [
+        allowed_global_intertwiners(tetrahedron, spin_data)
+        for tetrahedron in tetrahedra
+    ]
+
+    any(isempty, intertwiner_ranges) && return 0.0 + 0.0im
+
+    coefficient_table = coherent_intertwiner_coefficient_table(
+        tetrahedra,
+        intertwiner_ranges,
+        spin_data,
+        normal_data,
+    )
+
+    first_two_pairs = collect(Iterators.product(
+        intertwiner_ranges[1],
+        intertwiner_ranges[2],
+    ))
+
+    number_of_chunks =
+        nworkers() == 0 ? 1 :
+        min(length(first_two_pairs), nworkers() * chunks_per_worker)
+
+    chunks = split_into_chunks(first_two_pairs, number_of_chunks)
+
+    if nworkers() == 0
+        return su2_bf_intertwiner_chunk_sum(
+            simplex,
+            spin_data,
+            tetrahedra,
+            coefficient_table,
+            intertwiner_ranges,
+            only(chunks),
+        )
+    end
+
+    partial_sums = pmap(
+        chunk -> su2_bf_intertwiner_chunk_sum(
+            simplex,
+            spin_data,
+            tetrahedra,
+            coefficient_table,
+            intertwiner_ranges,
+            chunk,
+        ),
+        chunks,
+    )
+
+    return sum(partial_sums; init = 0.0 + 0.0im)
+end
+
+function su2_bf_coherent_lambda_row(lambda::Integer, base_spin, simplex)
     j = lambda * base_spin
     spin_data, normal_data = regular_4simplex_boundary_data(simplex, j)
 
     closure_error = max_closure_norm(simplex, spin_data, normal_data)
 
-    elapsed = @elapsed begin
-        W = coherent_su2_bf_single_vertex_amplitude_6j(
-            simplex,
-            spin_data,
-            normal_data,
-        )
-    end
+    W = 0.0 + 0.0im
+    elapsed = @elapsed W = su2_bf_coherent_amplitude_parallel_over_intertwiners(
+        simplex,
+        spin_data,
+        normal_data,
+    )
 
     scaled_W = lambda^6 * W
     S_int = regular_4simplex_su2_bf_regge_action(j; dihedral = :interior)
@@ -54,13 +174,12 @@ end
 
 function warmup_su2_bf_workers()
     if nprocs() == 1
-        su2_bf_coherent_lambda_row(1, base_spin, simplex)
+        warmup_su2_bf_worker(base_spin, simplex)
     else
         @sync for worker in workers()
             @async remotecall_fetch(
-                su2_bf_coherent_lambda_row,
+                warmup_su2_bf_worker,
                 worker,
-                1,
                 base_spin,
                 simplex,
             )
@@ -68,18 +187,6 @@ function warmup_su2_bf_workers()
     end
 
     return nothing
-end
-
-function run_su2_bf_scan(lambda_values)
-    if nprocs() == 1
-        return [su2_bf_coherent_lambda_row(lambda, base_spin, simplex)
-                for lambda in lambda_values]
-    end
-
-    return pmap(
-        lambda -> su2_bf_coherent_lambda_row(lambda, base_spin, simplex),
-        lambda_values,
-    )
 end
 
 function save_su2_bf_scan_csv(filename, scan)
@@ -108,6 +215,14 @@ function save_su2_bf_scan_csv(filename, scan)
             )
         end
     end
+end
+
+function checkpoint_su2_bf_scan(scan, csv_file, plot_file)
+    sorted_scan = sort(scan; by = row -> row.lambda)
+    save_su2_bf_scan_csv(csv_file, sorted_scan)
+    plot_su2_bf_scan(sorted_scan, plot_file)
+
+    return sorted_scan
 end
 
 function plot_su2_bf_scan(scan, plot_file)
@@ -157,24 +272,7 @@ function plot_su2_bf_scan(scan, plot_file)
     savefig(plot_file)
 end
 
-println("SU(2) BF vertex amplitude with coherent boundary state")
-println("vertex backend = fast 6j local vertex + fast 6j recoupling")
-println("simplex        = ", simplex)
-println("base spin      = ", base_spin)
-println("lambda values  = ", lambda_values)
-println("processes      = ", nprocs(), " total, ", nworkers(), " workers")
-println("cutoff         = none; this is a fixed-boundary coherent vertex amplitude")
-println()
-
-println("Warming up workers...")
-warmup_su2_bf_workers()
-
-println("Running lambda scan...")
-scan = sort(run_su2_bf_scan(lambda_values); by = row -> row.lambda)
-
-println()
-println("lambda  j       |W|                 arg(W)       Re(lambda^6 W)       Im(lambda^6 W)       time")
-for row in scan
+function print_scan_row(row)
     println(
         row.lambda, "       ",
         Float64(row.j), "     ",
@@ -184,7 +282,38 @@ for row in scan
         imag(row.scaled_W), "    ",
         row.elapsed,
     )
+    flush(stdout)
 end
+
+function run_su2_bf_scan_streaming(lambda_values, csv_file, plot_file)
+    scan = []
+
+    println()
+    println("lambda  j       |W|                 arg(W)       Re(lambda^6 W)       Im(lambda^6 W)       time")
+
+    for lambda in lambda_values
+        row = su2_bf_coherent_lambda_row(lambda, base_spin, simplex)
+        push!(scan, row)
+        checkpoint_su2_bf_scan(scan, csv_file, plot_file)
+        print_scan_row(row)
+    end
+
+    return checkpoint_su2_bf_scan(scan, csv_file, plot_file)
+end
+
+println("SU(2) BF vertex amplitude with coherent boundary state")
+println("vertex backend = fast 6j local vertex + fast 6j recoupling")
+println("simplex        = ", simplex)
+println("base spin      = ", base_spin)
+println("lambda values  = ", lambda_values)
+println("processes      = ", nprocs(), " total, ", nworkers(), " workers")
+println("parallelism    = over intertwiner chunks inside each lambda")
+println("chunks/worker  = ", chunks_per_worker)
+println("cutoff         = none; this is a fixed-boundary coherent vertex amplitude")
+println()
+
+println("Warming up workers...")
+warmup_su2_bf_workers()
 
 output_dir = joinpath(@__DIR__, "outputs")
 mkpath(output_dir)
@@ -192,8 +321,12 @@ mkpath(output_dir)
 csv_file = joinpath(output_dir, "su2_bf_coherent_vertex_lambda_scan.csv")
 plot_file = joinpath(output_dir, "su2_bf_coherent_lambda6_scan.png")
 
-save_su2_bf_scan_csv(csv_file, scan)
-plot_su2_bf_scan(scan, plot_file)
+println("Running lambda scan...")
+println("Each completed lambda is checkpointed immediately.")
+println("checkpoint data = ", csv_file)
+println("checkpoint plot = ", plot_file)
+
+scan = run_su2_bf_scan_streaming(lambda_values, csv_file, plot_file)
 
 println()
 println("Expected SU(2) BF large-spin structure:")
