@@ -121,19 +121,37 @@ function paper_twisted_spike_boundary_data(simplex, j)
         for triangle in oriented_simplex_spin_keys(simplex)
     )
 
-    # Full-precision reconstruction of the rounded normals shown in
-    # arXiv:1903.12624, Table 2.
+    # Exact radical expressions from arXiv:1708.01727, Appendix A, written in
+    # the tetrahedron-label convention used by this code.  This is the exact
+    # version of the previous decimal table: each tetrahedron closes, and the
+    # opposite orientation is generated below by n_ba = -n_ab.
     normal_pairs = Dict(
-        (1, 2) => ( 0.000000000000000,  0.000000000000000,  1.000000000000000),
-        (1, 3) => ( 0.942809041582063,  0.000000000000000, -0.333333333333333),
-        (1, 4) => (-0.471404520791032,  0.816496580927726, -0.333333333333333),
-        (1, 5) => (-0.471404520791032, -0.816496580927726, -0.333333333333333),
-        (2, 3) => (-0.235702260395516, -0.912870929175277,  0.333333333333333),
-        (2, 4) => ( 0.908420545240331,  0.252311319355707,  0.333333333333333),
-        (2, 5) => (-0.672718284844815,  0.660559609819570,  0.333333333333333),
-        (3, 4) => ( 0.090030252245699, -0.660559609819570, -0.745355992499930),
-        (3, 5) => ( 0.617076528940514, -0.252311319355707,  0.745355992499930),
-        (4, 5) => ( 0.527046276694815,  0.408248290463863, -0.745355992499930),
+        (1, 2) => (0, 0, 1),
+        (1, 3) => (2 * sqrt(2) / 3, 0, -1 / 3),
+        (1, 4) => (-sqrt(2) / 3, sqrt(2 / 3), -1 / 3),
+        (1, 5) => (-sqrt(2) / 3, -sqrt(2 / 3), -1 / 3),
+        (2, 3) => (-1 / (3 * sqrt(2)), -sqrt(5 / 6), 1 / 3),
+        (2, 4) => (
+            (1 + 3 * sqrt(5)) / (6 * sqrt(2)),
+            (sqrt(5) - 1) / (2 * sqrt(6)),
+            1 / 3,
+        ),
+        (2, 5) => (
+            (1 - 3 * sqrt(5)) / (6 * sqrt(2)),
+            (sqrt(3) + sqrt(15)) / (6 * sqrt(2)),
+            1 / 3,
+        ),
+        (3, 4) => (
+            -(sqrt(5) - 3) / (6 * sqrt(2)),
+            -(1 + sqrt(5)) / (2 * sqrt(6)),
+            -sqrt(5) / 3,
+        ),
+        (3, 5) => (
+            (3 + sqrt(5)) / (6 * sqrt(2)),
+            (1 - sqrt(5)) / (2 * sqrt(6)),
+            sqrt(5) / 3,
+        ),
+        (4, 5) => (sqrt(5 / 2) / 3, 1 / sqrt(6), -sqrt(5) / 3),
     )
 
     normal_data = Dict()
