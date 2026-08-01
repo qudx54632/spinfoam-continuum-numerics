@@ -1,12 +1,29 @@
 """
-Livine-Speziale coherent intertwiners in the fixed global basis.
+Livine-Speziale coherent boundary states in the fixed global basis.
 
 Reference:
     E. R. Livine and S. Speziale, arXiv:0705.0674.
 
-The coherent state convention follows their Eq. (12), and the coherent
-intertwiner is the group-averaged state of their Eq. (14).  The expansion
-coefficient in the conventional intertwiner basis follows Appendix A.
+The code uses the highest-weight SU(2) coherent state
+
+    |j,n> = g(n) |j,j>,
+
+where `g(n)` rotates the z-axis to the unit vector `n`.  In the magnetic
+basis this gives
+
+    <j,m|j,n>
+      = sqrt((2j)!/((j+m)!(j-m)!))
+        cos(theta/2)^(j+m) sin(theta/2)^(j-m)
+        exp[-i (j-m) phi].
+
+The coherent intertwiner coefficient used in the vertex amplitude is
+
+    c_i(j_l,n_l)
+      = sum_{m_l} conj(i_{m_1 m_2 m_3 m_4})
+                  prod_l <j_l,m_l|j_l,n_l>,
+
+with the magnetic constraint `m1+m2+m3+m4=0`.  The intertwiner channel is
+the normalized four-valent channel `(j1,j2) -> i -> (j3,j4)`.
 """
 
 const coherent_state_coefficient_cache = Dict()
@@ -38,22 +55,7 @@ function spherical_angles(n)
     return theta, phi
 end
 
-"""
-Coefficient `<j,m|j,n>` of the SU(2) coherent state.
-
-The convention is
-
-    |j,n> = g(n) |j,j>,
-
-with
-
-    <j,m|j,n>
-      = sqrt((2j)!/((j+m)!(j-m)!))
-        cos(theta/2)^(j+m) sin(theta/2)^(j-m)
-        exp[-i (j-m) phi].
-
-This is the Livine-Speziale coherent-state convention.
-"""
+"""Coefficient `<j,m|j,n>` of the SU(2) coherent state."""
 function coherent_state_coefficient(j, m, n)
     allowed_magnetic_label(j, m) ||
         throw(ArgumentError("m is not an allowed magnetic label for j"))
@@ -81,19 +83,7 @@ function coherent_state_coefficient(j, m, n)
     return value
 end
 
-"""
-Coefficient of the Livine-Speziale coherent intertwiner in the channel `i`.
-
-The intertwiner basis is the same normalized four-valent basis used elsewhere:
-
-    (j1,j2) -> i -> (j3,j4).
-
-For an invariant bra, the group average in the LS coherent intertwiner drops
-out of the coefficient, so
-
-    c_i(j_l,n_l)
-      = <i | j1,n1; j2,n2; j3,n3; j4,n4>.
-"""
+"""Coefficient `c_i(j_l,n_l)` of the coherent intertwiner in channel `i`."""
 function coherent_intertwiner_coefficient(spins, i, normals)
     spins = Tuple(spins)
     normals = Tuple(normals)

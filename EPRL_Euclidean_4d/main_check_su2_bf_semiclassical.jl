@@ -1,5 +1,7 @@
 include(joinpath(@__DIR__, "semiclassical", "semiclassical_vertex_tools.jl"))
 
+using Printf
+
 # Server-safe SU(2) BF coherent-boundary semiclassical scan.
 #
 # This script does not use Julia Distributed.  Instead, for each fixed lambda
@@ -196,24 +198,50 @@ if get(ENV, "SU2_BF_PARTIAL_WORKER", "0") == "1"
     exit()
 end
 
+ENV["GKSwstype"] = get(ENV, "GKSwstype", "100")
 using Plots
 
-function regge_cosine_fit(phases, values)
-    length(values) < 2 && return nothing
+function su2_bf_analytic_parameters()
+    dihedral = get(ENV, "SU2_BF_ANALYTIC_DIHEDRAL", "interior")
+    dihedral in ("interior", "exterior") ||
+        error("SU2_BF_ANALYTIC_DIHEDRAL must be either interior or exterior")
 
-    design_matrix = hcat(cos.(phases), sin.(phases))
-    coefficients = design_matrix \ values
-    fitted_values = design_matrix * coefficients
+    theta = dihedral == "interior" ? acos(1 / 4) : acos(-1 / 4)
+    omega = 5 * theta
 
-    cosine_coefficient, sine_coefficient = coefficients
-    amplitude = hypot(cosine_coefficient, sine_coefficient)
-    phase = atan(-sine_coefficient, cosine_coefficient)
+    det_unit = (1618200 - im * 316712 * sqrt(15)) / 177147
+    det_base = (1 / 2)^12 * det_unit
+    amplitude = (2pi)^6 * 2^4 / (4pi)^8 / sqrt(abs(det_base))
+    phase = dihedral == "interior" ? angle(det_base) / 2 : -angle(det_base) / 2
 
     return (
+        dihedral = dihedral,
+        omega = omega,
         amplitude = amplitude,
         phase = phase,
-        fitted_values = fitted_values,
     )
+end
+
+function dephasing_phase(sorted_scan)
+    for row in sorted_scan
+        row.lambda == 0 && continue
+        abs(row.scaled_W) == 0 && continue
+
+        return angle(row.scaled_W) / row.lambda
+    end
+
+    return 0.0
+end
+
+function symmetric_ticks(values)
+    isempty(values) && return [-1.0, 0.0, 1.0]
+
+    scale = maximum(abs.(values))
+    scale = scale == 0 ? 1.0 : scale
+    step = 10.0 ^ floor(log10(scale))
+    top = ceil(scale / step) * step
+
+    return collect(range(-top, top; length = 5))
 end
 
 function save_su2_bf_scan_csv(filename, scan)
@@ -245,78 +273,79 @@ function save_su2_bf_scan_csv(filename, scan)
 end
 
 function plot_su2_bf_scan(scan, plot_file)
-    x = [row.lambda for row in scan]
-    scaled_real = [real(row.scaled_W) for row in scan]
-    scaled_imag = [imag(row.scaled_W) for row in scan]
-    scaled_abs = [abs(row.scaled_W) for row in scan]
-    regge_phases = [row.S_ext for row in scan]
-    real_fit = regge_cosine_fit(regge_phases, scaled_real)
-    imag_fit = regge_cosine_fit(regge_phases, scaled_imag)
+    sorted_scan = sort(scan; by = row -> row.lambda)
+    x = [row.lambda for row in sorted_scan]
+    phase = dephasing_phase(sorted_scan)
 
-    p1 = plot(
+    dephased_values = [
+        exp(-im * phase * row.lambda) * row.scaled_W
+        for row in sorted_scan
+    ]
+    numerical_real = real.(dephased_values)
+    numerical_imag = imag.(dephased_values)
+
+    analytic = su2_bf_analytic_parameters()
+    analytic_points =
+        analytic.amplitude .* cos.(analytic.omega .* x .+ analytic.phase)
+
+    p_real = scatter(
         x,
-        scaled_real;
+        numerical_real;
+        color = :darkred,
+        markerstrokecolor = :darkred,
         marker = :circle,
-        label = "Re(lambda^6 W)",
-        ylabel = "lambda^6 W",
-    )
-
-    plot!(
-        p1,
-        x,
-        scaled_imag;
-        marker = :diamond,
-        label = "Im(lambda^6 W)",
-    )
-
-    if real_fit !== nothing
-        plot!(
-            p1,
-            x,
-            real_fit.fitted_values;
-            linestyle = :dash,
-            label = "Re fit: A cos(S_ext + phi)",
-        )
-    end
-
-    if imag_fit !== nothing
-        plot!(
-            p1,
-            x,
-            imag_fit.fitted_values;
-            linestyle = :dashdot,
-            label = "Im fit: A cos(S_ext + phi)",
-        )
-    end
-
-    p2 = plot(
-        x,
-        scaled_abs;
-        marker = :circle,
-        label = "|lambda^6 W|",
+        label = "Numerical data",
         xlabel = "lambda",
-        ylabel = "|lambda^6 W|",
+        ylabel = "Re[dephased lambda^6 W]",
+        title = "Real part, $(analytic.dihedral) angle convention",
     )
 
-    plot(p1, p2; layout = (2, 1), size = (900, 700))
+    scatter!(
+        p_real,
+        x,
+        analytic_points;
+        color = :white,
+        markerstrokecolor = :deepskyblue3,
+        marker = :circle,
+        label = "Analytic samples",
+    )
+
+    hline!(p_real, [0.0]; color = :black, linewidth = 1, label = "")
+
+    p_imag = scatter(
+        x,
+        numerical_imag;
+        color = :darkblue,
+        markerstrokecolor = :darkblue,
+        marker = :circle,
+        label = "Numerical data",
+        xlabel = "lambda",
+        ylabel = "Im[dephased lambda^6 W]",
+        title = "Imaginary part",
+        yticks = symmetric_ticks(numerical_imag),
+        yformatter = y -> @sprintf("%.1e", y),
+    )
+
+    hline!(p_imag, [0.0]; color = :black, linewidth = 1, label = "")
+
+    plot(p_real, p_imag; layout = (1, 2), size = (1200, 500))
     savefig(plot_file)
 end
 
-function print_regge_fit_summary(scan)
-    length(scan) < 2 && return nothing
-
+function print_su2_bf_check_summary(scan)
     sorted_scan = sort(scan; by = row -> row.lambda)
-    regge_phases = [row.S_ext for row in sorted_scan]
-    scaled_real = [real(row.scaled_W) for row in sorted_scan]
-    scaled_imag = [imag(row.scaled_W) for row in sorted_scan]
-
-    real_fit = regge_cosine_fit(regge_phases, scaled_real)
-    imag_fit = regge_cosine_fit(regge_phases, scaled_imag)
+    phase = dephasing_phase(sorted_scan)
+    analytic = su2_bf_analytic_parameters()
 
     println()
-    println("Least-squares Regge cosine fit:")
-    println("  Re(lambda^6 W) ≈ ", real_fit.amplitude, " cos(S_ext + ", real_fit.phase, ")")
-    println("  Im(lambda^6 W) ≈ ", imag_fit.amplitude, " cos(S_ext + ", imag_fit.phase, ")")
+    println("Paper-style coherent SU(2) BF check:")
+    println("  plotted data       = Re/Im[exp(-i Phi_c lambda) lambda^6 W(lambda)]")
+    println("  Phi_c              = ", phase)
+    println("  analytic dihedral  = ", analytic.dihedral)
+    println("  analytic samples   = A cos(omega lambda + phi)")
+    println("  A                  = ", analytic.amplitude)
+    println("  omega              = ", analytic.omega)
+    println("  phi                = ", analytic.phase)
 
     return nothing
 end
@@ -429,6 +458,7 @@ println("boundary data  = paper twisted-spike normals, arXiv:1903.12624 Table 2"
 println("lambda values  = ", lambda_values)
 println("chunk workers  = ", process_workers, " per lambda")
 println("cutoff         = none; this is a fixed-boundary coherent vertex amplitude")
+println("plot convention = dephase lambda^6 W and compare with analytic sample points")
 println()
 
 mkpath(output_dir)
@@ -452,9 +482,8 @@ end
 println()
 println("Expected SU(2) BF large-spin structure:")
 println("  W(lambda) ~ lambda^(-6) cos(lambda S_BF + constant phase)")
-println("To see the cosine sign oscillation, use Re(lambda^6 W) or Im(lambda^6 W).")
-println("|lambda^6 W| is useful as a magnitude/envelope check, but it removes signs.")
-print_regge_fit_summary(scan)
+println("The checkpoint plot removes the coherent-state global phase and keeps signs.")
+print_su2_bf_check_summary(scan)
 println()
 println("saved data     = ", csv_file)
 println("saved plot     = ", plot_file)
