@@ -5,8 +5,9 @@ using Printf
 # Server-safe Euclidean EPRL coherent-boundary single-vertex scan.
 #
 # This is the EPRL analogue of `main_check_su2_bf_semiclassical.jl`.
-# For each fixed lambda, independent Julia child processes split the sum over
-# the five boundary intertwiners `(i1,i2,i3,i4,i5)`.
+# For each fixed lambda, independent Julia child processes split the final
+# right-sector intertwiner sum.  The diagonal boundary intertwiners are summed
+# locally into coherent-fusion coefficients before the vertex contraction.
 
 ENV["GKSwstype"] = get(ENV, "GKSwstype", "100")
 
@@ -62,67 +63,170 @@ function eprl_boundary_spins_allowed(spin_data, gamma)
     return all(eprl_spin_allowed(j, gamma) for j in values(spin_data))
 end
 
-function eprl_intertwiner_chunk_sum(
-    simplex,
-    spin_data::AbstractDict,
-    tetrahedra,
-    coefficient_table::AbstractDict,
-    intertwiner_ranges,
-    first_two_intertwiner_pairs,
-    gamma,
-)
-    sigma = oriented_four_simplex(simplex)
-    total = 0.0 + 0.0im
-
-    for (i1, i2) in first_two_intertwiner_pairs,
-        i3 in intertwiner_ranges[3],
-        i4 in intertwiner_ranges[4],
-        i5 in intertwiner_ranges[5]
-
-        intertwiners = (i1, i2, i3, i4, i5)
-        coefficient_product = coherent_intertwiner_coefficient_product(
-            coefficient_table,
-            tetrahedra,
-            intertwiners,
-        )
-
-        abs(coefficient_product) == 0.0 && continue
-
-        intertwiner_data = Dict(
-            tetrahedron => i
-            for (tetrahedron, i) in zip(tetrahedra, intertwiners)
-        )
-
-        total += eprl_vertex_amplitude(
-            sigma,
-            spin_data,
-            intertwiner_data,
-            gamma,
-        ) * coefficient_product
-    end
-
-    return total
+function intertwiner_data_from_tuple(tetrahedra, intertwiners)
+    return Dict(
+        tetrahedron => i
+        for (tetrahedron, i) in zip(tetrahedra, intertwiners)
+    )
 end
 
-function first_two_intertwiner_pair_chunks(lambda, number_of_chunks)
+"""
+For each boundary tetrahedron tau, precompute
+
+    C_tau(iL,iR) = sum_i c_i(tau) f^i_{iL iR}(tau).
+
+This is the key speedup: the coherent boundary coefficient and the EPRL
+fusion map are both local to one tetrahedron, so the diagonal intertwiner
+sum can be done before summing the left and right SU(2) BF vertices.
+"""
+function coherent_fusion_tables(
+    tetrahedra,
+    spin_data::AbstractDict,
+    normal_data::AbstractDict,
+    gamma,
+)
+    diagonal_ranges = [
+        allowed_global_intertwiners(tetrahedron, spin_data)
+        for tetrahedron in tetrahedra
+    ]
+
+    coefficient_table = coherent_intertwiner_coefficient_table(
+        tetrahedra,
+        diagonal_ranges,
+        spin_data,
+        normal_data,
+    )
+
+    left_spin_data = eprl_left_spin_data(spin_data, gamma)
+    right_spin_data = eprl_right_spin_data(spin_data, gamma)
+
+    left_ranges = [
+        allowed_global_intertwiners(tetrahedron, left_spin_data)
+        for tetrahedron in tetrahedra
+    ]
+    right_ranges = [
+        allowed_global_intertwiners(tetrahedron, right_spin_data)
+        for tetrahedron in tetrahedra
+    ]
+
+    tables = [Dict() for _ in tetrahedra]
+
+    for (a, tetrahedron) in enumerate(tetrahedra)
+        spins = global_intertwiner_spins(tetrahedron, spin_data)
+
+        for i in diagonal_ranges[a]
+            c = coefficient_table[(tetrahedron, i)]
+            abs(c) == 0.0 && continue
+
+            for (iL, iR) in allowed_eprl_intertwiner_pairs(
+                tetrahedron,
+                spin_data,
+                i,
+                gamma,
+            )
+                f = eprl_fusion_coefficient(spins, i, iL, iR, gamma)
+                f == 0.0 && continue
+
+                key = (iL, iR)
+                tables[a][key] = get(tables[a], key, 0.0 + 0.0im) + c * f
+            end
+        end
+    end
+
+    return (
+        left_spin_data = left_spin_data,
+        right_spin_data = right_spin_data,
+        left_ranges = left_ranges,
+        right_ranges = right_ranges,
+        tables = tables,
+    )
+end
+
+function right_intertwiner_tuple_chunks(lambda, number_of_chunks)
     _, spin_data, _ = coherent_boundary_data_for_lambda(lambda)
 
     eprl_boundary_spins_allowed(spin_data, gamma) || return []
 
     tetrahedra = oriented_simplex_tetrahedra(simplex)
-    intertwiner_ranges = [
-        allowed_global_intertwiners(tetrahedron, spin_data)
+    right_spin_data = eprl_right_spin_data(spin_data, gamma)
+    right_ranges = [
+        allowed_global_intertwiners(tetrahedron, right_spin_data)
         for tetrahedron in tetrahedra
     ]
 
-    any(isempty, intertwiner_ranges) && return []
+    any(isempty, right_ranges) && return []
 
-    first_two_pairs = collect(Iterators.product(
-        intertwiner_ranges[1],
-        intertwiner_ranges[2],
-    ))
+    right_tuples = collect(Iterators.product(right_ranges...))
 
-    return split_into_chunks(first_two_pairs, number_of_chunks)
+    return split_into_chunks(right_tuples, number_of_chunks)
+end
+
+function coherent_fusion_product(tables, left_tuple, right_tuple)
+    product = 1.0 + 0.0im
+
+    for a in 1:length(tables)
+        c = get(tables[a], (left_tuple[a], right_tuple[a]), 0.0 + 0.0im)
+        abs(c) == 0.0 && return 0.0 + 0.0im
+        product *= c
+    end
+
+    return product
+end
+
+function eprl_rearranged_right_chunk_sum(
+    simplex,
+    spin_data::AbstractDict,
+    normal_data::AbstractDict,
+    right_tuple_chunk,
+    gamma,
+)
+    sigma = oriented_four_simplex(simplex)
+    tetrahedra = oriented_simplex_tetrahedra(sigma)
+
+    fusion_data = coherent_fusion_tables(
+        tetrahedra,
+        spin_data,
+        normal_data,
+        gamma,
+    )
+
+    left_vertex_table = simplex_amplitude_table_recoupled_oriented_6j(
+        sigma,
+        fusion_data.left_spin_data,
+        fusion_data.left_ranges,
+    )
+    right_vertex_table = simplex_amplitude_table_recoupled_oriented_6j(
+        sigma,
+        fusion_data.right_spin_data,
+        fusion_data.right_ranges,
+    )
+
+    left_vertices = [
+        (left_tuple = left_tuple, vertex = vertex)
+        for (left_tuple, vertex) in left_vertex_table
+        if vertex != 0.0
+    ]
+
+    total = 0.0 + 0.0im
+
+    for right_tuple in right_tuple_chunk
+        right_vertex = get(right_vertex_table, right_tuple, 0.0)
+
+        right_vertex == 0.0 && continue
+
+        for left_entry in left_vertices
+            coefficient = coherent_fusion_product(
+                fusion_data.tables,
+                left_entry.left_tuple,
+                right_tuple,
+            )
+
+            abs(coefficient) == 0.0 && continue
+            total += left_entry.vertex * right_vertex * coefficient
+        end
+    end
+
+    return total
 end
 
 function partial_sum_filename(lambda, chunk_id)
@@ -178,39 +282,14 @@ function run_partial_sum_worker()
         return nothing
     end
 
-    tetrahedra = oriented_simplex_tetrahedra(simplex)
-    intertwiner_ranges = [
-        allowed_global_intertwiners(tetrahedron, spin_data)
-        for tetrahedron in tetrahedra
-    ]
-
-    any(isempty, intertwiner_ranges) && begin
-        write_partial_sum(output_file, lambda, chunk_id, nchunks, 0.0 + 0.0im, 0.0)
-        return nothing
-    end
-
-    coefficient_table = coherent_intertwiner_coefficient_table(
-        tetrahedra,
-        intertwiner_ranges,
-        spin_data,
-        normal_data,
-    )
-
-    first_two_pairs = collect(Iterators.product(
-        intertwiner_ranges[1],
-        intertwiner_ranges[2],
-    ))
-
-    chunks = split_into_chunks(first_two_pairs, nchunks)
+    chunks = right_intertwiner_tuple_chunks(lambda, nchunks)
     chunk = chunk_id <= length(chunks) ? chunks[chunk_id] : []
 
     partial_sum = 0.0 + 0.0im
-    elapsed = @elapsed partial_sum = eprl_intertwiner_chunk_sum(
+    elapsed = @elapsed partial_sum = eprl_rearranged_right_chunk_sum(
         simplex,
         spin_data,
-        tetrahedra,
-        coefficient_table,
-        intertwiner_ranges,
+        normal_data,
         chunk,
         gamma,
     )
@@ -368,7 +447,7 @@ function run_lambda_with_process_chunks(lambda)
         )
     end
 
-    chunks = first_two_intertwiner_pair_chunks(lambda, process_workers)
+    chunks = right_intertwiner_tuple_chunks(lambda, process_workers)
     nchunks = length(chunks)
 
     nchunks == 0 && begin
@@ -455,7 +534,8 @@ end
 
 println("Euclidean EPRL vertex amplitude with coherent boundary state")
 println("vertex backend = EPRL fusion map + fast 6j SU(2) BF vertices")
-println("parallelism    = independent Julia processes over boundary-intertwiner chunks")
+println("summation      = local coherent-fusion tables C_tau(iL,iR)")
+println("parallelism    = independent Julia processes over right-sector chunks")
 println("simplex        = ", simplex)
 println("gamma          = ", gamma)
 println("base spin      = ", base_spin)
